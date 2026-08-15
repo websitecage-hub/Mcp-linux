@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from urllib.parse import quote
 
 from mcp.server.fastmcp import FastMCP
-from starlette.responses import FileResponse, JSONResponse, PlainTextResponse
+from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, HTMLResponse
 from starlette.requests import Request
 
 # ============================================================
@@ -54,7 +54,7 @@ UPLOAD_SESSION_TTL_SECONDS = max(
 REQUEST_TIMEOUT_SECONDS = max(5, int(os.environ.get("MCP_REQUEST_TIMEOUT", "120")))
 
 # ============================================================
-# MCP SERVER (Railway-safe: no host-header rejection, no auth)
+# MCP SERVER
 # ============================================================
 
 def _build_mcp():
@@ -65,12 +65,14 @@ def _build_mcp():
             "You are an autonomous Linux coding/workstation backend. "
             "Use run_command for quick commands. "
             "Use start_job for long-running commands. "
-            "Use upload_base64 to upload files. "
+            "Use upload_base64 only for SMALL text/binary payloads. "
+            "Chat attachments CANNOT be sent through MCP. For real files, "
+            "tell the user to open the web upload page at the server root URL, "
+            "drop the file there, then operate on it in the workspace. "
+            "Alternatively use download_url if the user provides a public URL. "
             "Use download_file for generated artifacts."
         ),
     }
-    # Only exists in newer 1.x SDKs. Disables the DNS-rebinding
-    # Host-header check that causes "Invalid Host header" on Railway.
     try:
         from mcp.server.transport_security import TransportSecuritySettings
         kwargs["transport_security"] = TransportSecuritySettings(
@@ -434,12 +436,12 @@ def finalize_upload_session(upload_id: str) -> dict:
     return upload_response(meta, "complete")
 
 # ============================================================
-# MCP TOOL: BASE64 UPLOAD (this is the reliable one for LLM clients)
+# MCP TOOL: BASE64 UPLOAD (small payloads only)
 # ============================================================
 
 @mcp.tool()
 def upload_base64(filename: str, content_base64: str, destination: str = ".") -> str:
-    """Upload a file using base64 encoding. Works for small to medium files."""
+    """Upload a SMALL file using base64. For real files use the web upload page."""
     if not content_base64:
         return "ERROR: empty base64 payload"
     filename = sanitize_filename(filename)
@@ -465,6 +467,71 @@ def upload_base64(filename: str, content_base64: str, destination: str = ".") ->
         }, indent=2)
     except Exception as exc:
         return f"ERROR: failed to write file: {exc}"
+
+# ============================================================
+# WEB UPLOAD PAGE (drag & drop from your browser)
+# ============================================================
+
+UPLOAD_PAGE_HTML = """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VPS Upload</title>
+<style>
+body{font-family:system-ui,sans-serif;background:#0b0f14;color:#e6edf3;max-width:720px;margin:40px auto;padding:0 16px}
+h1{font-size:22px}
+#drop{border:2px dashed #30363d;border-radius:12px;padding:48px 16px;text-align:center;cursor:pointer;margin:16px 0}
+#drop.on{border-color:#2f81f7;background:#0d1a2b}
+input[type=text]{background:#161b22;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:6px 10px;width:220px}
+#log div{padding:8px 10px;margin:6px 0;border-radius:6px;background:#161b22;border:1px solid #30363d;font-family:ui-monospace,monospace;font-size:13px;word-break:break-all}
+#log div.ok{border-color:#238636}
+#log div.err{border-color:#da3633}
+</style>
+</head>
+<body>
+<h1>Personal VPS - File Upload</h1>
+<p>Drop files from your computer. They land directly in the VPS workspace, then tell the chat the filename.</p>
+<div id="drop"><b>Drop files here</b><br>or click to select<input type="file" id="file" multiple hidden></div>
+<p>Destination folder: <input type="text" id="dest" value="."></p>
+<div id="log"></div>
+<script>
+var drop=document.getElementById('drop'),input=document.getElementById('file'),
+    log=document.getElementById('log'),dest=document.getElementById('dest');
+drop.onclick=function(){input.click()};
+drop.ondragover=function(e){e.preventDefault();drop.classList.add('on')};
+drop.ondragleave=function(){drop.classList.remove('on')};
+drop.ondrop=function(e){e.preventDefault();drop.classList.remove('on');handle(e.dataTransfer.files)};
+input.onchange=function(){handle(input.files)};
+function handle(files){for(var i=0;i<files.length;i++){upload(files[i])}}
+async function upload(f){
+  var line=document.createElement('div');
+  line.textContent='Uploading '+f.name+' ('+f.size+' bytes)...';
+  log.prepend(line);
+  var fd=new FormData();
+  fd.append('file',f,f.name);
+  fd.append('destination',dest.value||'.');
+  try{
+    var r=await fetch('/upload',{method:'POST',body:fd});
+    var j=await r.json();
+    if(j.ok){
+      line.className='ok';
+      line.textContent='OK '+f.name+' -> '+(j.destination||'')+' | '+(j.bytes_received||0)+' bytes | sha256 '+(j.sha256||'').slice(0,16);
+    }else{
+      line.className='err';
+      line.textContent='FAIL '+f.name+': '+(j.error||'unknown error');
+    }
+  }catch(e){
+    line.className='err';
+    line.textContent='ERROR '+f.name+': '+e;
+  }
+}
+</script>
+</body>
+</html>"""
+
+async def upload_page_endpoint(request: Request):
+    return HTMLResponse(UPLOAD_PAGE_HTML)
 
 # ============================================================
 # HTTP UPLOAD ENDPOINTS
@@ -886,7 +953,7 @@ async def health_endpoint(request: Request):
         stat = shutil.disk_usage(WORKDIR)
         return JSONResponse({
             "ok": True, "service": "personal-vps",
-            "mcp": "/mcp", "upload": "/upload",
+            "mcp": "/mcp", "upload_page": "/",
             "workspace": str(WORKDIR),
             "max_upload_mb": MAX_UPLOAD_MB,
             "disk_free_bytes": stat.free,
@@ -908,6 +975,8 @@ def cleanup_loop():
 
 threading.Thread(target=cleanup_loop, daemon=True).start()
 
+mcp.custom_route("/", methods=["GET"])(upload_page_endpoint)
+mcp.custom_route("/upload-page", methods=["GET"])(upload_page_endpoint)
 mcp.custom_route("/upload", methods=["POST"])(upload_endpoint)
 mcp.custom_route("/upload/raw", methods=["PUT", "POST"])(upload_raw_endpoint)
 mcp.custom_route("/upload/init", methods=["POST"])(upload_init_endpoint)
