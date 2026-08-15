@@ -508,94 +508,153 @@ async def upload_resource(
     ctx: Context,
 ) -> str:
     """
-    Copy a file supplied by the MCP client/chat into the VPS workspace.
+    Copy a binary/text file supplied by the MCP client/chat into the VPS workspace.
 
-    The MCP host should pass the uploaded attachment as a Resource.
-    Example destination: audio/testing.wav
+    The MCP host should pass an uploaded attachment as a Resource.  This is the
+    preferred ChatGPT/MCP upload path because binary attachments remain binary
+    instead of being forced through a text-only argument.
+
+    Example:
+        destination="audio/testing.wav"
     """
-
     if not file_info:
         return "ERROR: no uploaded resource supplied"
 
-    destination_path = safe_path(
-        destination
-    )
+    destination_path = safe_path(destination)
 
-    destination_path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    # Prevent accidental writes to an enormous single file.  Adjust through env.
+    max_upload_mb = max(1, int(os.environ.get("MCP_MAX_UPLOAD_MB", "512")))
+    max_upload_bytes = max_upload_mb * 1024 * 1024
+
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-
-        contents = await ctx.read_resource(
-            file_info.uri
-        )
-
+        contents = await ctx.read_resource(file_info.uri)
     except Exception as exc:
-
         return (
-            "ERROR: could not read uploaded "
-            f"MCP resource {file_info.uri}: {exc}"
+            "ERROR: could not read uploaded MCP resource "
+            f"{file_info.uri}: {exc}"
         )
 
     if not contents:
-
-        return (
-            "ERROR: uploaded resource "
-            "contained no data"
-        )
-
-    # The SDK returns resource contents.
-    # Handle both text and binary resource forms.
+        return "ERROR: uploaded resource contained no data"
 
     first = contents[0]
-
     data = None
 
+    # Binary MCP resource.
     if hasattr(first, "blob") and first.blob:
+        try:
+            data = base64.b64decode(first.blob, validate=True)
+        except Exception as exc:
+            return f"ERROR: invalid base64 resource data: {exc}"
 
-        data = base64.b64decode(
-            first.blob
-        )
-
+    # Text MCP resource.
     elif hasattr(first, "text") and first.text is not None:
-
-        data = first.text.encode(
-            "utf-8"
-        )
+        data = first.text.encode("utf-8")
 
     if data is None:
+        return "ERROR: unsupported MCP resource content type"
 
+    if len(data) > max_upload_bytes:
         return (
-            "ERROR: unsupported MCP resource "
-            "content type"
+            f"ERROR: upload is {len(data)} bytes, exceeding the "
+            f"MCP_MAX_UPLOAD_MB limit of {max_upload_mb} MB"
         )
 
-    destination_path.write_bytes(
-        data
+    # Atomic write: never leave a half-written upload if the process is
+    # interrupted while writing.
+    temp_path = destination_path.with_name(
+        f".{destination_path.name}.{uuid.uuid4().hex}.upload"
     )
+    try:
+        temp_path.write_bytes(data)
+        temp_path.replace(destination_path)
+    except Exception:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
 
     return json.dumps(
         {
             "ok": True,
-            "source_uri": str(
-                file_info.uri
-            ),
-            "destination": relative_path(
-                destination_path
-            ),
+            "source_uri": str(file_info.uri),
+            "destination": relative_path(destination_path),
             "bytes": len(data),
-            "name": getattr(
-                file_info,
-                "name",
-                None,
-            ),
-            "mime_type": getattr(
-                file_info,
-                "mimeType",
-                None,
-            ),
+            "name": getattr(file_info, "name", None),
+            "mime_type": getattr(file_info, "mimeType", None),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        },
+        indent=2,
+    )
+
+
+@mcp.tool()
+def upload_base64(
+    filename: str,
+    content_base64: str,
+    destination: str = ".",
+) -> str:
+    """
+    Upload binary data supplied directly as base64.
+
+    This is a compatibility fallback for MCP clients that cannot expose an
+    attachment as a Resource.  The model/client can send base64 data and the
+    VPS writes it atomically into the workspace.
+
+    Example:
+        filename="testing.wav"
+        destination="audio"
+    """
+    if not filename or filename in {".", ".."}:
+        return "ERROR: invalid filename"
+
+    # Never allow a client-supplied filename to escape the requested directory.
+    clean_name = Path(filename).name
+    if clean_name != filename:
+        return "ERROR: filename must be a simple file name"
+
+    destination_dir = safe_path(destination)
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    target = safe_path(str(Path(destination) / clean_name))
+
+    max_upload_mb = max(1, int(os.environ.get("MCP_MAX_UPLOAD_MB", "512")))
+    max_upload_bytes = max_upload_mb * 1024 * 1024
+
+    try:
+        data = base64.b64decode(content_base64, validate=True)
+    except Exception as exc:
+        return f"ERROR: invalid base64 data: {exc}"
+
+    if len(data) > max_upload_bytes:
+        return (
+            f"ERROR: upload is {len(data)} bytes, exceeding the "
+            f"MCP_MAX_UPLOAD_MB limit of {max_upload_mb} MB"
+        )
+
+    temp_path = target.with_name(
+        f".{target.name}.{uuid.uuid4().hex}.upload"
+    )
+    try:
+        temp_path.write_bytes(data)
+        temp_path.replace(target)
+    except Exception:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+
+    return json.dumps(
+        {
+            "ok": True,
+            "destination": relative_path(target),
+            "bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "mime_type": mimetypes.guess_type(target.name)[0]
+                or "application/octet-stream",
         },
         indent=2,
     )
@@ -1139,6 +1198,108 @@ def zip_directory(
 
 
 # ============================================================
+# CHAT / HTTP MULTIPART UPLOAD COMPATIBILITY
+# ============================================================
+
+async def upload_endpoint(request):
+    """
+    POST /upload as multipart/form-data.
+
+    Form fields:
+      - file: uploaded binary
+      - destination: optional workspace-relative directory
+
+    This exists for MCP/client integrations that can make HTTP requests but
+    cannot expose an MCP Resource attachment.
+    """
+    try:
+        form = await request.form()
+    except Exception as exc:
+        return JSONResponse(
+            {"ok": False, "error": f"invalid multipart request: {exc}"},
+            status_code=400,
+        )
+
+    upload = form.get("file")
+    destination = str(form.get("destination", "."))
+
+    if upload is None or not hasattr(upload, "read") or not hasattr(upload, "filename"):
+        return JSONResponse(
+            {"ok": False, "error": "multipart field 'file' is required"},
+            status_code=400,
+        )
+
+    filename = Path(upload.filename or "upload.bin").name
+    if not filename or filename in {".", ".."}:
+        return JSONResponse(
+            {"ok": False, "error": "invalid filename"},
+            status_code=400,
+        )
+
+    try:
+        destination_dir = safe_path(destination)
+    except ValueError:
+        return JSONResponse(
+            {"ok": False, "error": "invalid destination"},
+            status_code=400,
+        )
+
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    target = safe_path(str(Path(destination) / filename))
+
+    max_upload_mb = max(1, int(os.environ.get("MCP_MAX_UPLOAD_MB", "512")))
+    max_upload_bytes = max_upload_mb * 1024 * 1024
+
+    # Stream to disk in chunks so uploads do not require holding the whole file
+    # in RAM.
+    temp_path = target.with_name(
+        f".{target.name}.{uuid.uuid4().hex}.upload"
+    )
+    total = 0
+
+    try:
+        with open(temp_path, "wb") as output:
+            while True:
+                chunk = await upload.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_upload_bytes:
+                    raise ValueError(
+                        f"upload exceeds {max_upload_mb} MB limit"
+                    )
+                output.write(chunk)
+
+        temp_path.replace(target)
+
+        return JSONResponse(
+            {
+                "ok": True,
+                "destination": relative_path(target),
+                "bytes": total,
+                "name": filename,
+                "mime_type": mimetypes.guess_type(filename)[0]
+                    or "application/octet-stream",
+                "sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+            }
+        )
+    except Exception as exc:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return JSONResponse(
+            {"ok": False, "error": str(exc)},
+            status_code=400,
+        )
+    finally:
+        try:
+            await upload.close()
+        except Exception:
+            pass
+
+
+# ============================================================
 # PUBLIC FILE DOWNLOAD
 # ============================================================
 
@@ -1228,6 +1389,11 @@ async def health_endpoint(
 # streamable_http_app() owns /mcp.
 
 mcp.custom_route(
+    "/upload",
+    methods=["POST"],
+)(upload_endpoint)
+
+mcp.custom_route(
     "/files/{path:path}",
     methods=["GET"],
 )(download_endpoint)
@@ -1270,7 +1436,7 @@ if __name__ == "__main__":
     print("PERSONAL VPS AGENT")
     print("==========================================")
     print("MCP:    /mcp")
-    print("Files:  /files/<path>")
+    print("Upload: /upload (POST multipart)\n    Files:  /files/<path>")
     print("Health: /health")
     print("==========================================")
 
