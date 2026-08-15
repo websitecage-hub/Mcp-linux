@@ -265,7 +265,7 @@ if __name__ == "__main__":
     # localhost by default ("Invalid Host header"). Disabling it entirely
     # here, consistent with running this as an open, no-auth personal server.
     security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
-    app = mcp.streamable_http_app(transport_security=security)
-    print("MCP endpoint: /mcp  (open, no auth, any host allowed)")
+    app = mcp.streamable_http_app(transport_security=security, stateless_http=True)
+    print("MCP endpoint: /mcp  (open, no auth, any host allowed, stateless)")
     uvicorn.run(app, host="0.0.0.0", port=port)
-        
+    
