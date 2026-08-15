@@ -10,15 +10,17 @@ import mimetypes
 import subprocess
 import threading
 import urllib.request
+import urllib.error
 import zipfile
+import time
 import tempfile
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
+from urllib.parse import quote, urlparse
 
 from mcp.server import MCPServer
 from mcp.types import Resource
 
-# Context import for the current MCP Python SDK line.
 try:
     from mcp.server.fastmcp import Context
 except ImportError:
@@ -33,9 +35,11 @@ from starlette.responses import (
     PlainTextResponse,
 )
 
+from starlette.requests import Request
+
 
 # ============================================================
-# WORKSPACE
+# CONFIGURATION
 # ============================================================
 
 WORKDIR = Path(
@@ -51,10 +55,86 @@ WORKDIR.mkdir(
 )
 
 JOBS_DIR = WORKDIR / ".jobs"
-
 JOBS_DIR.mkdir(
     parents=True,
     exist_ok=True,
+)
+
+UPLOADS_DIR = WORKDIR / ".uploads"
+UPLOADS_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+TMP_DIR = WORKDIR / ".tmp"
+TMP_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+
+PORT = int(
+    os.environ.get(
+        "PORT",
+        "8000",
+    )
+)
+
+PUBLIC_BASE_URL = os.environ.get(
+    "MCP_PUBLIC_BASE_URL",
+    "",
+).rstrip("/")
+
+
+MAX_UPLOAD_MB = max(
+    1,
+    int(
+        os.environ.get(
+            "MCP_MAX_UPLOAD_MB",
+            "4096",
+        )
+    ),
+)
+
+MAX_UPLOAD_BYTES = (
+    MAX_UPLOAD_MB * 1024 * 1024
+)
+
+
+UPLOAD_CHUNK_MB = max(
+    1,
+    int(
+        os.environ.get(
+            "MCP_UPLOAD_CHUNK_MB",
+            "8",
+        )
+    ),
+)
+
+UPLOAD_CHUNK_BYTES = (
+    UPLOAD_CHUNK_MB * 1024 * 1024
+)
+
+
+UPLOAD_SESSION_TTL_SECONDS = max(
+    300,
+    int(
+        os.environ.get(
+            "MCP_UPLOAD_SESSION_TTL",
+            str(24 * 60 * 60),
+        )
+    ),
+)
+
+
+REQUEST_TIMEOUT_SECONDS = max(
+    5,
+    int(
+        os.environ.get(
+            "MCP_REQUEST_TIMEOUT",
+            "120",
+        )
+    ),
 )
 
 
@@ -68,14 +148,35 @@ mcp = MCPServer(
         "You are an autonomous Linux coding/workstation backend. "
         "Use run_command for quick commands. "
         "Use start_job for long-running commands. "
-        "Use job_status and job_output for background jobs. "
-        "Uploaded chat files are provided as MCP Resources; use "
-        "upload_resource to copy them into the VPS workspace. "
-        "Use download_file to obtain a direct URL for generated artifacts. "
-        "Use read_file for text/data files. "
-        "Use download_url for internet downloads."
+        "For uploaded files, never assume that a file:// URI points "
+        "to the VPS filesystem. Use upload_resource only when the "
+        "MCP client actually provides readable resource contents. "
+        "For direct HTTP clients, use the upload API. "
+        "For small binary payloads, upload_base64 may be used. "
+        "Use download_file for generated artifacts."
     ),
 )
+
+
+# ============================================================
+# GLOBAL LOCK
+# ============================================================
+
+UPLOAD_LOCK = threading.RLock()
+
+
+# ============================================================
+# TIME HELPERS
+# ============================================================
+
+def utc_now():
+    return datetime.now(
+        timezone.utc
+    )
+
+
+def utc_iso():
+    return utc_now().isoformat()
 
 
 # ============================================================
@@ -83,12 +184,26 @@ mcp = MCPServer(
 # ============================================================
 
 def safe_path(path: str) -> Path:
+    if path is None:
+        raise ValueError(
+            "Path is required"
+        )
+
+    path = str(path)
+
+    if "\x00" in path:
+        raise ValueError(
+            "Path contains null byte"
+        )
+
     target = (
         WORKDIR / path
     ).resolve()
 
     try:
-        target.relative_to(WORKDIR)
+        target.relative_to(
+            WORKDIR
+        )
     except ValueError:
         raise ValueError(
             "Path escapes workspace"
@@ -99,8 +214,154 @@ def safe_path(path: str) -> Path:
 
 def relative_path(path: Path) -> str:
     return str(
-        path.resolve().relative_to(WORKDIR)
+        path.resolve().relative_to(
+            WORKDIR
+        )
     )
+
+
+def sanitize_filename(filename: str) -> str:
+    if not filename:
+        return "upload.bin"
+
+    filename = str(filename)
+
+    if "\x00" in filename:
+        raise ValueError(
+            "Invalid filename"
+        )
+
+    name = Path(filename).name
+
+    if name in {
+        "",
+        ".",
+        "..",
+    }:
+        raise ValueError(
+            "Invalid filename"
+        )
+
+    # Prevent control characters.
+    name = "".join(
+        ch
+        for ch in name
+        if ord(ch) >= 32
+        and ord(ch) != 127
+    )
+
+    if not name:
+        raise ValueError(
+            "Invalid filename"
+        )
+
+    return name
+
+
+def destination_file(
+    destination: str,
+    filename: str,
+) -> Path:
+
+    filename = sanitize_filename(
+        filename
+    )
+
+    directory = safe_path(
+        destination or "."
+    )
+
+    directory.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    target = safe_path(
+        str(
+            Path(destination or ".")
+            / filename
+        )
+    )
+
+    return target
+
+
+# ============================================================
+# HASHING
+# ============================================================
+
+def sha256_file(
+    path: Path,
+) -> str:
+
+    digest = hashlib.sha256()
+
+    with open(
+        path,
+        "rb",
+    ) as handle:
+
+        while True:
+
+            chunk = handle.read(
+                1024 * 1024
+            )
+
+            if not chunk:
+                break
+
+            digest.update(
+                chunk
+            )
+
+    return digest.hexdigest()
+
+
+# ============================================================
+# ATOMIC WRITE
+# ============================================================
+
+def atomic_write_bytes(
+    target: Path,
+    data: bytes,
+):
+
+    target.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    temp = target.with_name(
+        f".{target.name}."
+        f"{uuid.uuid4().hex}.tmp"
+    )
+
+    try:
+
+        with open(
+            temp,
+            "wb",
+        ) as handle:
+
+            handle.write(data)
+            handle.flush()
+            os.fsync(
+                handle.fileno()
+            )
+
+        os.replace(
+            temp,
+            target,
+        )
+
+    finally:
+
+        try:
+            temp.unlink(
+                missing_ok=True
+            )
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -122,7 +383,10 @@ def system_info() -> str:
         "node": "node --version 2>/dev/null || true",
         "npm": "npm --version 2>/dev/null || true",
         "git": "git --version 2>/dev/null || true",
-        "ffmpeg": "ffmpeg -version 2>/dev/null | head -1 || true",
+        "ffmpeg": (
+            "ffmpeg -version 2>/dev/null "
+            "| head -1 || true"
+        ),
     }
 
     result = {}
@@ -164,12 +428,6 @@ def run_command(
     command: str,
     timeout_seconds: int = 60,
 ) -> str:
-    """
-    Run a shell command synchronously.
-
-    Use start_job for installs, builds, renders, downloads,
-    model downloads, servers, or anything long-running.
-    """
 
     timeout_seconds = max(
         1,
@@ -204,12 +462,21 @@ def run_command(
             f"Use start_job."
         )
 
+    except Exception as exc:
+
+        return (
+            f"ERROR: {type(exc).__name__}: "
+            f"{exc}"
+        )
+
 
 # ============================================================
 # BACKGROUND JOBS
 # ============================================================
 
-def job_paths(job_id: str):
+def job_paths(
+    job_id: str,
+):
 
     if not re.fullmatch(
         r"[0-9a-f]{12}",
@@ -219,7 +486,9 @@ def job_paths(job_id: str):
             "Invalid job id"
         )
 
-    directory = JOBS_DIR / job_id
+    directory = (
+        JOBS_DIR / job_id
+    )
 
     return (
         directory,
@@ -233,9 +502,6 @@ def job_paths(job_id: str):
 def start_job(
     command: str,
 ) -> str:
-    """
-    Start a long-running shell command.
-    """
 
     job_id = uuid.uuid4().hex[:12]
 
@@ -255,46 +521,83 @@ def start_job(
         "job_id": job_id,
         "command": command,
         "status": "running",
-        "started_at": datetime.utcnow().isoformat(),
+        "started_at": utc_iso(),
         "pid": None,
     }
 
     meta_file.write_text(
-        json.dumps(meta, indent=2)
+        json.dumps(
+            meta,
+            indent=2,
+        )
     )
 
     def worker():
 
-        with (
-            open(stdout_log, "w") as stdout,
-            open(stderr_log, "w") as stderr,
-        ):
+        try:
 
-            process = subprocess.Popen(
-                command,
-                shell=True,
-                cwd=str(WORKDIR),
-                stdout=stdout,
-                stderr=stderr,
-                preexec_fn=os.setsid,
-            )
+            with (
+                open(
+                    stdout_log,
+                    "w",
+                ) as stdout,
+                open(
+                    stderr_log,
+                    "w",
+                ) as stderr,
+            ):
 
-            meta["pid"] = process.pid
+                process = subprocess.Popen(
+                    command,
+                    shell=True,
+                    cwd=str(WORKDIR),
+                    stdout=stdout,
+                    stderr=stderr,
+                    preexec_fn=os.setsid,
+                )
 
-            meta_file.write_text(
-                json.dumps(meta, indent=2)
-            )
+                meta["pid"] = (
+                    process.pid
+                )
 
-            code = process.wait()
+                meta_file.write_text(
+                    json.dumps(
+                        meta,
+                        indent=2,
+                    )
+                )
 
-            meta["status"] = "finished"
-            meta["exit_code"] = code
+                code = process.wait()
+
+                meta["status"] = (
+                    "finished"
+                )
+
+                meta["exit_code"] = code
+                meta["finished_at"] = (
+                    utc_iso()
+                )
+
+                meta_file.write_text(
+                    json.dumps(
+                        meta,
+                        indent=2,
+                    )
+                )
+
+        except Exception as exc:
+
+            meta["status"] = "failed"
+            meta["error"] = str(exc)
             meta["finished_at"] = (
-                datetime.utcnow().isoformat()
+                utc_iso()
             )
 
             meta_file.write_text(
-                json.dumps(meta, indent=2)
+                json.dumps(
+                    meta,
+                    indent=2,
+                )
             )
 
     threading.Thread(
@@ -312,9 +615,6 @@ def start_job(
 def job_status(
     job_id: str,
 ) -> str:
-    """
-    Get status and recent output of a job.
-    """
 
     (
         directory,
@@ -363,9 +663,6 @@ def job_status(
 def job_output(
     job_id: str,
 ) -> str:
-    """
-    Get complete stdout and stderr.
-    """
 
     (
         directory,
@@ -404,9 +701,6 @@ def job_output(
 
 @mcp.tool()
 def list_jobs() -> str:
-    """
-    List all background jobs.
-    """
 
     rows = []
 
@@ -414,7 +708,9 @@ def list_jobs() -> str:
         JOBS_DIR.iterdir()
     ):
 
-        meta_file = directory / "meta.json"
+        meta_file = (
+            directory / "meta.json"
+        )
 
         if not meta_file.exists():
             continue
@@ -445,9 +741,6 @@ def list_jobs() -> str:
 def kill_job(
     job_id: str,
 ) -> str:
-    """
-    Kill a running background job.
-    """
 
     (
         directory,
@@ -489,7 +782,10 @@ def kill_job(
     meta["status"] = "killed"
 
     meta_file.write_text(
-        json.dumps(meta, indent=2)
+        json.dumps(
+            meta,
+            indent=2,
+        )
     )
 
     return (
@@ -498,7 +794,596 @@ def kill_job(
 
 
 # ============================================================
-# CHAT → VPS FILE UPLOAD
+# UPLOAD SESSION STORAGE
+# ============================================================
+
+def upload_session_dir(
+    upload_id: str,
+) -> Path:
+
+    if not re.fullmatch(
+        r"[0-9a-f]{32}",
+        upload_id,
+    ):
+        raise ValueError(
+            "Invalid upload id"
+        )
+
+    return (
+        UPLOADS_DIR / upload_id
+    )
+
+
+def upload_session_meta(
+    upload_id: str,
+) -> Path:
+
+    return (
+        upload_session_dir(
+            upload_id
+        )
+        / "meta.json"
+    )
+
+
+def upload_session_data(
+    upload_id: str,
+) -> Path:
+
+    return (
+        upload_session_dir(
+            upload_id
+        )
+        / "data.part"
+    )
+
+
+def save_upload_meta(
+    meta: dict,
+):
+
+    path = upload_session_meta(
+        meta["upload_id"]
+    )
+
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    temp = path.with_suffix(
+        ".tmp"
+    )
+
+    temp.write_text(
+        json.dumps(
+            meta,
+            indent=2,
+        )
+    )
+
+    os.replace(
+        temp,
+        path,
+    )
+
+
+def load_upload_meta(
+    upload_id: str,
+) -> dict:
+
+    path = upload_session_meta(
+        upload_id
+    )
+
+    if not path.exists():
+
+        raise FileNotFoundError(
+            "Upload session not found"
+        )
+
+    return json.loads(
+        path.read_text()
+    )
+
+
+def cleanup_stale_uploads():
+
+    now = time.time()
+
+    for directory in (
+        UPLOADS_DIR.iterdir()
+    ):
+
+        if not directory.is_dir():
+            continue
+
+        meta_file = (
+            directory / "meta.json"
+        )
+
+        if not meta_file.exists():
+            continue
+
+        try:
+
+            meta = json.loads(
+                meta_file.read_text()
+            )
+
+            created = float(
+                meta.get(
+                    "created_unix",
+                    0,
+                )
+            )
+
+            if (
+                now - created
+                > UPLOAD_SESSION_TTL_SECONDS
+            ):
+
+                shutil.rmtree(
+                    directory,
+                    ignore_errors=True,
+                )
+
+        except Exception:
+
+            continue
+
+
+def upload_response(
+    meta: dict,
+    status: str = "success",
+) -> dict:
+
+    return {
+        "ok": True,
+        "status": status,
+        "upload_id": meta.get(
+            "upload_id"
+        ),
+        "filename": meta.get(
+            "filename"
+        ),
+        "destination": meta.get(
+            "destination"
+        ),
+        "bytes_received": meta.get(
+            "bytes_received",
+            0,
+        ),
+        "expected_bytes": meta.get(
+            "expected_bytes"
+        ),
+        "complete": meta.get(
+            "complete",
+            False,
+        ),
+        "sha256": meta.get(
+            "sha256"
+        ),
+        "mime_type": meta.get(
+            "mime_type"
+        ),
+    }
+
+
+# ============================================================
+# CREATE UPLOAD SESSION
+# ============================================================
+
+def create_upload_session(
+    filename: str,
+    destination: str = ".",
+    expected_bytes: int | None = None,
+    expected_sha256: str | None = None,
+    mime_type: str | None = None,
+) -> dict:
+
+    filename = sanitize_filename(
+        filename
+    )
+
+    if expected_bytes is not None:
+
+        expected_bytes = int(
+            expected_bytes
+        )
+
+        if expected_bytes < 0:
+            raise ValueError(
+                "expected_bytes must be >= 0"
+            )
+
+        if (
+            expected_bytes
+            > MAX_UPLOAD_BYTES
+        ):
+            raise ValueError(
+                f"File exceeds "
+                f"{MAX_UPLOAD_MB} MB limit"
+            )
+
+    if expected_sha256:
+
+        expected_sha256 = (
+            expected_sha256.lower()
+            .strip()
+        )
+
+        if not re.fullmatch(
+            r"[0-9a-f]{64}",
+            expected_sha256,
+        ):
+            raise ValueError(
+                "expected_sha256 must be "
+                "a valid SHA-256 hash"
+            )
+
+    target = destination_file(
+        destination,
+        filename,
+    )
+
+    upload_id = uuid.uuid4().hex
+
+    directory = upload_session_dir(
+        upload_id
+    )
+
+    directory.mkdir(
+        parents=True,
+        exist_ok=False,
+    )
+
+    meta = {
+        "upload_id": upload_id,
+        "filename": filename,
+        "destination": relative_path(
+            target
+        ),
+        "target": str(target),
+        "expected_bytes": expected_bytes,
+        "expected_sha256": expected_sha256,
+        "mime_type": (
+            mime_type
+            or mimetypes.guess_type(
+                filename
+            )[0]
+            or "application/octet-stream"
+        ),
+        "bytes_received": 0,
+        "complete": False,
+        "status": "created",
+        "created_at": utc_iso(),
+        "created_unix": time.time(),
+    }
+
+    save_upload_meta(
+        meta
+    )
+
+    data_file = upload_session_data(
+        upload_id
+    )
+
+    data_file.touch()
+
+    return meta
+
+
+# ============================================================
+# APPEND UPLOAD CHUNK
+# ============================================================
+
+async def append_upload_stream(
+    upload_id: str,
+    request: Request,
+    offset: int | None = None,
+) -> dict:
+
+    cleanup_stale_uploads()
+
+    meta = load_upload_meta(
+        upload_id
+    )
+
+    if meta.get("complete"):
+        return upload_response(
+            meta,
+            "already_complete",
+        )
+
+    data_file = upload_session_data(
+        upload_id
+    )
+
+    with UPLOAD_LOCK:
+
+        current_size = (
+            data_file.stat().st_size
+            if data_file.exists()
+            else 0
+        )
+
+        if offset is not None:
+
+            offset = int(offset)
+
+            if offset != current_size:
+                raise ValueError(
+                    f"Upload offset mismatch. "
+                    f"Server expects {current_size}, "
+                    f"client sent {offset}."
+                )
+
+        if (
+            current_size
+            >= MAX_UPLOAD_BYTES
+        ):
+            raise ValueError(
+                "Upload already reached maximum size"
+            )
+
+        written = 0
+
+        with open(
+            data_file,
+            "ab",
+        ) as output:
+
+            while True:
+
+                chunk = await request.body()
+
+                if chunk:
+                    output.write(
+                        chunk
+                    )
+                    written += len(
+                        chunk
+                    )
+
+                break
+
+        total = (
+            current_size
+            + written
+        )
+
+        if total > MAX_UPLOAD_BYTES:
+
+            # Roll back this request.
+            with open(
+                data_file,
+                "rb+",
+            ) as output:
+
+                output.truncate(
+                    current_size
+                )
+
+            raise ValueError(
+                f"Upload exceeds "
+                f"{MAX_UPLOAD_MB} MB limit"
+            )
+
+        meta[
+            "bytes_received"
+        ] = total
+
+        meta["status"] = (
+            "uploading"
+        )
+
+        save_upload_meta(
+            meta
+        )
+
+    return upload_response(
+        meta,
+        "chunk_received",
+    )
+
+
+# ============================================================
+# NOTE:
+# request.body() above is intentionally simple.
+# For very large HTTP chunks, the route below uses a streaming
+# implementation instead.
+# ============================================================
+
+async def stream_append(
+    request: Request,
+    output,
+    max_bytes: int,
+    already_received: int,
+):
+
+    received = (
+        already_received
+    )
+
+    while True:
+
+        chunk = await request.stream().__anext__()
+
+        if not chunk:
+            break
+
+        if (
+            received
+            + len(chunk)
+            > max_bytes
+        ):
+            raise ValueError(
+                f"Upload exceeds "
+                f"{MAX_UPLOAD_MB} MB limit"
+            )
+
+        output.write(
+            chunk
+        )
+
+        received += len(
+            chunk
+        )
+
+    return received
+
+
+# ============================================================
+# FINALIZE UPLOAD
+# ============================================================
+
+def finalize_upload_session(
+    upload_id: str,
+) -> dict:
+
+    cleanup_stale_uploads()
+
+    meta = load_upload_meta(
+        upload_id
+    )
+
+    if meta.get("complete"):
+
+        return upload_response(
+            meta,
+            "already_complete",
+        )
+
+    data_file = upload_session_data(
+        upload_id
+    )
+
+    if not data_file.exists():
+
+        raise ValueError(
+            "Upload data does not exist"
+        )
+
+    size = data_file.stat().st_size
+
+    expected = meta.get(
+        "expected_bytes"
+    )
+
+    if (
+        expected is not None
+        and size != expected
+    ):
+        raise ValueError(
+            f"Size mismatch: "
+            f"expected {expected} bytes, "
+            f"received {size}"
+        )
+
+    if size > MAX_UPLOAD_BYTES:
+
+        raise ValueError(
+            f"Upload exceeds "
+            f"{MAX_UPLOAD_MB} MB limit"
+        )
+
+    digest = sha256_file(
+        data_file
+    )
+
+    expected_hash = meta.get(
+        "expected_sha256"
+    )
+
+    if (
+        expected_hash
+        and digest != expected_hash
+    ):
+        raise ValueError(
+            "SHA-256 verification failed"
+        )
+
+    target = Path(
+        meta["target"]
+    )
+
+    target = safe_path(
+        relative_path(target)
+    )
+
+    target.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    temp_target = target.with_name(
+        f".{target.name}."
+        f"{uuid.uuid4().hex}.finalizing"
+    )
+
+    try:
+
+        shutil.copyfile(
+            data_file,
+            temp_target,
+        )
+
+        with open(
+            temp_target,
+            "rb",
+        ) as handle:
+
+            os.fsync(
+                handle.fileno()
+            )
+
+        os.replace(
+            temp_target,
+            target,
+        )
+
+    finally:
+
+        try:
+            temp_target.unlink(
+                missing_ok=True
+            )
+        except Exception:
+            pass
+
+    meta[
+        "bytes_received"
+    ] = size
+
+    meta["sha256"] = digest
+    meta["complete"] = True
+    meta["status"] = "complete"
+    meta["completed_at"] = (
+        utc_iso()
+    )
+
+    save_upload_meta(
+        meta
+    )
+
+    # Keep metadata for a short period,
+    # but remove potentially large partial data.
+    try:
+        data_file.unlink(
+            missing_ok=True
+        )
+    except Exception:
+        pass
+
+    return upload_response(
+        meta,
+        "complete",
+    )
+
+
+# ============================================================
+# MCP RESOURCE UPLOAD
 # ============================================================
 
 @mcp.tool()
@@ -508,88 +1393,141 @@ async def upload_resource(
     ctx: Context,
 ) -> str:
     """
-    Copy a binary/text file supplied by the MCP client/chat into the VPS workspace.
+    Upload a binary/text MCP Resource into the workspace.
 
-    The MCP host should pass an uploaded attachment as a Resource.  This is the
-    preferred ChatGPT/MCP upload path because binary attachments remain binary
-    instead of being forced through a text-only argument.
-
-    Example:
-        destination="audio/testing.wav"
+    Important:
+    The URI must be readable by the MCP server/resource provider.
+    A ChatGPT-local file:// URI is NOT automatically readable by a
+    remote VPS.
     """
+
     if not file_info:
-        return "ERROR: no uploaded resource supplied"
 
-    destination_path = safe_path(destination)
-
-    # Prevent accidental writes to an enormous single file.  Adjust through env.
-    max_upload_mb = max(1, int(os.environ.get("MCP_MAX_UPLOAD_MB", "512")))
-    max_upload_bytes = max_upload_mb * 1024 * 1024
-
-    destination_path.parent.mkdir(parents=True, exist_ok=True)
+        return (
+            "ERROR: no uploaded resource supplied"
+        )
 
     try:
-        contents = await ctx.read_resource(file_info.uri)
+
+        contents = await ctx.read_resource(
+            file_info.uri
+        )
+
     except Exception as exc:
+
         return (
-            "ERROR: could not read uploaded MCP resource "
-            f"{file_info.uri}: {exc}"
+            "ERROR: could not read uploaded MCP "
+            f"resource {file_info.uri}: {exc}. "
+            "The MCP host must expose the attachment "
+            "as an actual readable Resource."
         )
 
     if not contents:
-        return "ERROR: uploaded resource contained no data"
 
-    first = contents[0]
-    data = None
-
-    # Binary MCP resource.
-    if hasattr(first, "blob") and first.blob:
-        try:
-            data = base64.b64decode(first.blob, validate=True)
-        except Exception as exc:
-            return f"ERROR: invalid base64 resource data: {exc}"
-
-    # Text MCP resource.
-    elif hasattr(first, "text") and first.text is not None:
-        data = first.text.encode("utf-8")
-
-    if data is None:
-        return "ERROR: unsupported MCP resource content type"
-
-    if len(data) > max_upload_bytes:
         return (
-            f"ERROR: upload is {len(data)} bytes, exceeding the "
-            f"MCP_MAX_UPLOAD_MB limit of {max_upload_mb} MB"
+            "ERROR: uploaded resource contained no data"
         )
 
-    # Atomic write: never leave a half-written upload if the process is
-    # interrupted while writing.
-    temp_path = destination_path.with_name(
-        f".{destination_path.name}.{uuid.uuid4().hex}.upload"
-    )
-    try:
-        temp_path.write_bytes(data)
-        temp_path.replace(destination_path)
-    except Exception:
+    first = contents[0]
+
+    data = None
+
+    if (
+        hasattr(first, "blob")
+        and first.blob
+    ):
+
         try:
-            temp_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-        raise
+
+            data = base64.b64decode(
+                first.blob,
+                validate=True,
+            )
+
+        except Exception as exc:
+
+            return (
+                "ERROR: invalid base64 resource data: "
+                f"{exc}"
+            )
+
+    elif (
+        hasattr(first, "text")
+        and first.text is not None
+    ):
+
+        data = first.text.encode(
+            "utf-8"
+        )
+
+    if data is None:
+
+        return (
+            "ERROR: unsupported MCP resource content type"
+        )
+
+    if len(data) > MAX_UPLOAD_BYTES:
+
+        return (
+            f"ERROR: upload is "
+            f"{len(data)} bytes, exceeding "
+            f"the {MAX_UPLOAD_MB} MB limit"
+        )
+
+    filename = sanitize_filename(
+        getattr(
+            file_info,
+            "name",
+            None,
+        )
+        or "upload.bin"
+    )
+
+    target = destination_file(
+        destination,
+        filename,
+    )
+
+    atomic_write_bytes(
+        target,
+        data,
+    )
+
+    digest = hashlib.sha256(
+        data
+    ).hexdigest()
 
     return json.dumps(
         {
             "ok": True,
-            "source_uri": str(file_info.uri),
-            "destination": relative_path(destination_path),
+            "source_uri": str(
+                file_info.uri
+            ),
+            "destination": relative_path(
+                target
+            ),
             "bytes": len(data),
-            "name": getattr(file_info, "name", None),
-            "mime_type": getattr(file_info, "mimeType", None),
-            "sha256": hashlib.sha256(data).hexdigest(),
+            "name": filename,
+            "mime_type": (
+                getattr(
+                    file_info,
+                    "mimeType",
+                    None,
+                )
+                or mimetypes.guess_type(
+                    filename
+                )[0]
+                or "application/octet-stream"
+            ),
+            "sha256": digest,
         },
         indent=2,
     )
 
+
+# ============================================================
+# BASE64 UPLOAD
+# ============================================================
 
 @mcp.tool()
 def upload_base64(
@@ -597,67 +1535,682 @@ def upload_base64(
     content_base64: str,
     destination: str = ".",
 ) -> str:
-    """
-    Upload binary data supplied directly as base64.
 
-    This is a compatibility fallback for MCP clients that cannot expose an
-    attachment as a Resource.  The model/client can send base64 data and the
-    VPS writes it atomically into the workspace.
+    if not content_base64:
 
-    Example:
-        filename="testing.wav"
-        destination="audio"
-    """
-    if not filename or filename in {".", ".."}:
-        return "ERROR: invalid filename"
-
-    # Never allow a client-supplied filename to escape the requested directory.
-    clean_name = Path(filename).name
-    if clean_name != filename:
-        return "ERROR: filename must be a simple file name"
-
-    destination_dir = safe_path(destination)
-    destination_dir.mkdir(parents=True, exist_ok=True)
-    target = safe_path(str(Path(destination) / clean_name))
-
-    max_upload_mb = max(1, int(os.environ.get("MCP_MAX_UPLOAD_MB", "512")))
-    max_upload_bytes = max_upload_mb * 1024 * 1024
-
-    try:
-        data = base64.b64decode(content_base64, validate=True)
-    except Exception as exc:
-        return f"ERROR: invalid base64 data: {exc}"
-
-    if len(data) > max_upload_bytes:
         return (
-            f"ERROR: upload is {len(data)} bytes, exceeding the "
-            f"MCP_MAX_UPLOAD_MB limit of {max_upload_mb} MB"
+            "ERROR: empty base64 payload"
         )
 
-    temp_path = target.with_name(
-        f".{target.name}.{uuid.uuid4().hex}.upload"
+    filename = sanitize_filename(
+        filename
     )
+
     try:
-        temp_path.write_bytes(data)
-        temp_path.replace(target)
-    except Exception:
-        try:
-            temp_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-        raise
+
+        data = base64.b64decode(
+            content_base64,
+            validate=True,
+        )
+
+    except Exception as exc:
+
+        return (
+            f"ERROR: invalid base64 data: {exc}"
+        )
+
+    if len(data) > MAX_UPLOAD_BYTES:
+
+        return (
+            f"ERROR: upload is "
+            f"{len(data)} bytes, exceeding "
+            f"the {MAX_UPLOAD_MB} MB limit"
+        )
+
+    target = destination_file(
+        destination,
+        filename,
+    )
+
+    atomic_write_bytes(
+        target,
+        data,
+    )
 
     return json.dumps(
         {
             "ok": True,
-            "destination": relative_path(target),
+            "destination": relative_path(
+                target
+            ),
             "bytes": len(data),
-            "sha256": hashlib.sha256(data).hexdigest(),
-            "mime_type": mimetypes.guess_type(target.name)[0]
-                or "application/octet-stream",
+            "sha256": hashlib.sha256(
+                data
+            ).hexdigest(),
+            "mime_type": (
+                mimetypes.guess_type(
+                    target.name
+                )[0]
+                or "application/octet-stream"
+            ),
         },
         indent=2,
     )
+
+
+# ============================================================
+# HTTP: CREATE UPLOAD SESSION
+# ============================================================
+
+async def upload_init_endpoint(
+    request: Request,
+):
+
+    try:
+
+        payload = await request.json()
+
+        filename = payload.get(
+            "filename"
+        )
+
+        destination = payload.get(
+            "destination",
+            ".",
+        )
+
+        expected_bytes = payload.get(
+            "expected_bytes"
+        )
+
+        expected_sha256 = payload.get(
+            "sha256"
+        )
+
+        mime_type = payload.get(
+            "mime_type"
+        )
+
+        meta = create_upload_session(
+            filename=filename,
+            destination=destination,
+            expected_bytes=expected_bytes,
+            expected_sha256=expected_sha256,
+            mime_type=mime_type,
+        )
+
+        return JSONResponse(
+            {
+                "ok": True,
+                "upload_id": meta[
+                    "upload_id"
+                ],
+                "chunk_size": (
+                    UPLOAD_CHUNK_BYTES
+                ),
+                "max_upload_bytes": (
+                    MAX_UPLOAD_BYTES
+                ),
+                "destination": meta[
+                    "destination"
+                ],
+                "filename": meta[
+                    "filename"
+                ],
+            }
+        )
+
+    except Exception as exc:
+
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": str(exc),
+            },
+            status_code=400,
+        )
+
+
+# ============================================================
+# HTTP: UPLOAD CHUNK
+# ============================================================
+
+async def upload_chunk_endpoint(
+    request: Request,
+):
+
+    upload_id = (
+        request.path_params.get(
+            "upload_id"
+        )
+    )
+
+    try:
+
+        meta = load_upload_meta(
+            upload_id
+        )
+
+        if meta.get("complete"):
+
+            return JSONResponse(
+                upload_response(
+                    meta,
+                    "already_complete",
+                )
+            )
+
+        data_file = (
+            upload_session_data(
+                upload_id
+            )
+        )
+
+        with UPLOAD_LOCK:
+
+            current = (
+                data_file.stat().st_size
+                if data_file.exists()
+                else 0
+            )
+
+            offset_header = (
+                request.headers.get(
+                    "x-upload-offset"
+                )
+            )
+
+            if offset_header is not None:
+
+                offset = int(
+                    offset_header
+                )
+
+                if offset != current:
+
+                    return JSONResponse(
+                        {
+                            "ok": False,
+                            "error": (
+                                "offset mismatch"
+                            ),
+                            "expected_offset": (
+                                current
+                            ),
+                        },
+                        status_code=409,
+                    )
+
+            total = current
+
+            with open(
+                data_file,
+                "ab",
+            ) as output:
+
+                async for chunk in (
+                    request.stream()
+                ):
+
+                    if not chunk:
+                        continue
+
+                    total += len(
+                        chunk
+                    )
+
+                    if (
+                        total
+                        > MAX_UPLOAD_BYTES
+                    ):
+                        raise ValueError(
+                            f"Upload exceeds "
+                            f"{MAX_UPLOAD_MB} MB limit"
+                        )
+
+                    output.write(
+                        chunk
+                    )
+
+                output.flush()
+
+                os.fsync(
+                    output.fileno()
+                )
+
+            meta[
+                "bytes_received"
+            ] = total
+
+            meta["status"] = (
+                "uploading"
+            )
+
+            save_upload_meta(
+                meta
+            )
+
+        return JSONResponse(
+            {
+                "ok": True,
+                "upload_id": upload_id,
+                "bytes_received": total,
+                "next_offset": total,
+                "complete": False,
+            }
+        )
+
+    except FileNotFoundError:
+
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "upload session not found",
+            },
+            status_code=404,
+        )
+
+    except Exception as exc:
+
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": str(exc),
+            },
+            status_code=400,
+        )
+
+
+# ============================================================
+# HTTP: UPLOAD STATUS
+# ============================================================
+
+async def upload_status_endpoint(
+    request: Request,
+):
+
+    upload_id = (
+        request.path_params.get(
+            "upload_id"
+        )
+    )
+
+    try:
+
+        meta = load_upload_meta(
+            upload_id
+        )
+
+        return JSONResponse(
+            upload_response(
+                meta,
+                "status",
+            )
+        )
+
+    except FileNotFoundError:
+
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "upload session not found",
+            },
+            status_code=404,
+        )
+
+    except Exception as exc:
+
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": str(exc),
+            },
+            status_code=400,
+        )
+
+
+# ============================================================
+# HTTP: FINALIZE UPLOAD
+# ============================================================
+
+async def upload_finalize_endpoint(
+    request: Request,
+):
+
+    upload_id = (
+        request.path_params.get(
+            "upload_id"
+        )
+    )
+
+    try:
+
+        result = finalize_upload_session(
+            upload_id
+        )
+
+        return JSONResponse(
+            result
+        )
+
+    except FileNotFoundError:
+
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "upload session not found",
+            },
+            status_code=404,
+        )
+
+    except Exception as exc:
+
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": str(exc),
+            },
+            status_code=400,
+        )
+
+
+# ============================================================
+# HTTP: SIMPLE RAW UPLOAD
+# ============================================================
+
+async def upload_raw_endpoint(
+    request: Request,
+):
+
+    filename = (
+        request.query_params.get(
+            "filename"
+        )
+        or request.headers.get(
+            "x-filename"
+        )
+        or "upload.bin"
+    )
+
+    destination = (
+        request.query_params.get(
+            "destination",
+            ".",
+        )
+    )
+
+    expected_sha256 = (
+        request.headers.get(
+            "x-sha256"
+        )
+    )
+
+    content_length = (
+        request.headers.get(
+            "content-length"
+        )
+    )
+
+    try:
+
+        filename = sanitize_filename(
+            filename
+        )
+
+        destination = str(
+            destination
+        )
+
+        expected_bytes = (
+            int(content_length)
+            if content_length
+            else None
+        )
+
+        if (
+            expected_bytes is not None
+            and expected_bytes
+            > MAX_UPLOAD_BYTES
+        ):
+
+            raise ValueError(
+                f"Upload exceeds "
+                f"{MAX_UPLOAD_MB} MB limit"
+            )
+
+        meta = create_upload_session(
+            filename=filename,
+            destination=destination,
+            expected_bytes=expected_bytes,
+            expected_sha256=expected_sha256,
+            mime_type=(
+                request.headers.get(
+                    "content-type"
+                )
+            ),
+        )
+
+        upload_id = meta[
+            "upload_id"
+        ]
+
+        data_file = upload_session_data(
+            upload_id
+        )
+
+        received = 0
+
+        with open(
+            data_file,
+            "wb",
+        ) as output:
+
+            async for chunk in (
+                request.stream()
+            ):
+
+                if not chunk:
+                    continue
+
+                received += len(
+                    chunk
+                )
+
+                if (
+                    received
+                    > MAX_UPLOAD_BYTES
+                ):
+                    raise ValueError(
+                        f"Upload exceeds "
+                        f"{MAX_UPLOAD_MB} MB limit"
+                    )
+
+                output.write(
+                    chunk
+                )
+
+            output.flush()
+
+            os.fsync(
+                output.fileno()
+            )
+
+        meta[
+            "bytes_received"
+        ] = received
+
+        save_upload_meta(
+            meta
+        )
+
+        result = finalize_upload_session(
+            upload_id
+        )
+
+        return JSONResponse(
+            result
+        )
+
+    except Exception as exc:
+
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": str(exc),
+            },
+            status_code=400,
+        )
+
+
+# ============================================================
+# HTTP: MULTIPART COMPATIBILITY UPLOAD
+# ============================================================
+
+async def upload_endpoint(
+    request: Request,
+):
+
+    try:
+
+        max_size = (
+            MAX_UPLOAD_BYTES
+        )
+
+        form = await request.form(
+            max_part_size=max_size
+        )
+
+        upload = form.get(
+            "file"
+        )
+
+        destination = str(
+            form.get(
+                "destination",
+                ".",
+            )
+        )
+
+        if (
+            upload is None
+            or not hasattr(
+                upload,
+                "read",
+            )
+            or not hasattr(
+                upload,
+                "filename",
+            )
+        ):
+
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": (
+                        "multipart field "
+                        "'file' is required"
+                    ),
+                },
+                status_code=400,
+            )
+
+        filename = sanitize_filename(
+            upload.filename
+        )
+
+        meta = create_upload_session(
+            filename=filename,
+            destination=destination,
+            expected_bytes=None,
+            expected_sha256=None,
+            mime_type=getattr(
+                upload,
+                "content_type",
+                None,
+            ),
+        )
+
+        upload_id = meta[
+            "upload_id"
+        ]
+
+        data_file = upload_session_data(
+            upload_id
+        )
+
+        received = 0
+
+        try:
+
+            with open(
+                data_file,
+                "wb",
+            ) as output:
+
+                while True:
+
+                    chunk = await upload.read(
+                        UPLOAD_CHUNK_BYTES
+                    )
+
+                    if not chunk:
+                        break
+
+                    received += len(
+                        chunk
+                    )
+
+                    if (
+                        received
+                        > MAX_UPLOAD_BYTES
+                    ):
+                        raise ValueError(
+                            f"Upload exceeds "
+                            f"{MAX_UPLOAD_MB} MB limit"
+                        )
+
+                    output.write(
+                        chunk
+                    )
+
+                output.flush()
+
+                os.fsync(
+                    output.fileno()
+                )
+
+            meta[
+                "bytes_received"
+            ] = received
+
+            save_upload_meta(
+                meta
+            )
+
+            result = finalize_upload_session(
+                upload_id
+            )
+
+            return JSONResponse(
+                result
+            )
+
+        finally:
+
+            try:
+                await upload.close()
+            except Exception:
+                pass
+
+    except Exception as exc:
+
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": str(exc),
+            },
+            status_code=400,
+        )
 
 
 # ============================================================
@@ -670,11 +2223,10 @@ def write_file(
     content: str,
     base64_encoded: bool = False,
 ) -> str:
-    """
-    Create or overwrite a workspace file.
-    """
 
-    target = safe_path(path)
+    target = safe_path(
+        path
+    )
 
     target.parent.mkdir(
         parents=True,
@@ -683,14 +2235,27 @@ def write_file(
 
     if base64_encoded:
 
-        target.write_bytes(
-            base64.b64decode(content)
+        data = base64.b64decode(
+            content,
+            validate=True,
+        )
+
+        if len(data) > MAX_UPLOAD_BYTES:
+            return (
+                "ERROR: content exceeds "
+                f"{MAX_UPLOAD_MB} MB limit"
+            )
+
+        atomic_write_bytes(
+            target,
+            data,
         )
 
     else:
 
         target.write_text(
-            content
+            content,
+            encoding="utf-8",
         )
 
     return (
@@ -704,11 +2269,10 @@ def read_file(
     path: str,
     base64_encoded: bool = False,
 ) -> str:
-    """
-    Read a workspace file.
-    """
 
-    target = safe_path(path)
+    target = safe_path(
+        path
+    )
 
     if not target.exists():
 
@@ -739,11 +2303,10 @@ def edit_file(
     old_str: str,
     new_str: str,
 ) -> str:
-    """
-    Replace one exact unique string.
-    """
 
-    target = safe_path(path)
+    target = safe_path(
+        path
+    )
 
     if not target.exists():
 
@@ -758,10 +2321,11 @@ def edit_file(
     )
 
     if count == 0:
-        return "ERROR: old_str not found"
+        return (
+            "ERROR: old_str not found"
+        )
 
     if count > 1:
-
         return (
             f"ERROR: old_str occurs "
             f"{count} times"
@@ -782,11 +2346,10 @@ def edit_file(
 def delete_file(
     path: str,
 ) -> str:
-    """
-    Delete a workspace file or directory.
-    """
 
-    target = safe_path(path)
+    target = safe_path(
+        path
+    )
 
     if not target.exists():
 
@@ -796,15 +2359,15 @@ def delete_file(
 
     if target.is_dir():
 
-        shutil.rmtree(target)
+        shutil.rmtree(
+            target
+        )
 
     else:
 
         target.unlink()
 
-    return (
-        f"Deleted {path}"
-    )
+    return f"Deleted {path}"
 
 
 @mcp.tool()
@@ -812,12 +2375,14 @@ def move_file(
     source: str,
     destination: str,
 ) -> str:
-    """
-    Move/rename a workspace file or directory.
-    """
 
-    src = safe_path(source)
-    dst = safe_path(destination)
+    src = safe_path(
+        source
+    )
+
+    dst = safe_path(
+        destination
+    )
 
     if not src.exists():
 
@@ -845,12 +2410,14 @@ def copy_file(
     source: str,
     destination: str,
 ) -> str:
-    """
-    Copy a workspace file or directory.
-    """
 
-    src = safe_path(source)
-    dst = safe_path(destination)
+    src = safe_path(
+        source
+    )
+
+    dst = safe_path(
+        destination
+    )
 
     if not src.exists():
 
@@ -887,11 +2454,10 @@ def copy_file(
 def list_files(
     path: str = ".",
 ) -> str:
-    """
-    List files and directories.
-    """
 
-    target = safe_path(path)
+    target = safe_path(
+        path
+    )
 
     if not target.exists():
 
@@ -938,13 +2504,14 @@ def search_files(
     path: str = ".",
     max_results: int = 100,
 ) -> str:
-    """
-    Search workspace file contents with regex.
-    """
 
-    target = safe_path(path)
+    target = safe_path(
+        path
+    )
 
-    regex = re.compile(pattern)
+    regex = re.compile(
+        pattern
+    )
 
     hits = []
 
@@ -953,19 +2520,23 @@ def search_files(
     ):
 
         dirs[:] = [
-            d for d in dirs
-            if d not in (
+            d
+            for d in dirs
+            if d not in {
                 ".git",
                 "__pycache__",
                 "node_modules",
                 ".jobs",
-            )
+                ".uploads",
+                ".tmp",
+            }
         ]
 
         for filename in files:
 
             file_path = (
-                Path(root) / filename
+                Path(root)
+                / filename
             )
 
             try:
@@ -974,14 +2545,16 @@ def search_files(
                     file_path,
                     "r",
                     errors="ignore",
-                ) as file:
+                ) as handle:
 
                     for line_number, line in enumerate(
-                        file,
+                        handle,
                         1,
                     ):
 
-                        if regex.search(line):
+                        if regex.search(
+                            line
+                        ):
 
                             hits.append(
                                 f"{file_path.relative_to(WORKDIR)}:"
@@ -989,17 +2562,21 @@ def search_files(
                                 f"{line.strip()[:300]}"
                             )
 
-                            if len(hits) >= max_results:
+                            if (
+                                len(hits)
+                                >= max_results
+                            ):
 
-                                return "\n".join(
-                                    hits
+                                return (
+                                    "\n".join(
+                                        hits
+                                    )
                                 )
 
             except (
                 PermissionError,
                 OSError,
             ):
-
                 pass
 
     return (
@@ -1010,18 +2587,17 @@ def search_files(
 
 
 # ============================================================
-# FILE METADATA
+# FILE INFO / VERIFICATION
 # ============================================================
 
 @mcp.tool()
 def file_info(
     path: str,
 ) -> str:
-    """
-    Return file metadata.
-    """
 
-    target = safe_path(path)
+    target = safe_path(
+        path
+    )
 
     if not target.exists():
 
@@ -1037,22 +2613,74 @@ def file_info(
 
     stat = target.stat()
 
-    mime = (
-        mimetypes.guess_type(
-            target.name
-        )[0]
-        or "application/octet-stream"
-    )
-
     return json.dumps(
         {
             "path": path,
             "name": target.name,
             "bytes": stat.st_size,
-            "mime_type": mime,
+            "mime_type": (
+                mimetypes.guess_type(
+                    target.name
+                )[0]
+                or "application/octet-stream"
+            ),
             "modified": datetime.fromtimestamp(
-                stat.st_mtime
+                stat.st_mtime,
+                timezone.utc,
             ).isoformat(),
+        },
+        indent=2,
+    )
+
+
+@mcp.tool()
+def verify_file(
+    path: str,
+) -> str:
+
+    target = safe_path(
+        path
+    )
+
+    if not target.exists():
+
+        return json.dumps(
+            {
+                "ok": False,
+                "error": "file does not exist",
+            },
+            indent=2,
+        )
+
+    if not target.is_file():
+
+        return json.dumps(
+            {
+                "ok": False,
+                "error": "not a file",
+            },
+            indent=2,
+        )
+
+    stat = target.stat()
+
+    return json.dumps(
+        {
+            "ok": True,
+            "path": relative_path(
+                target
+            ),
+            "name": target.name,
+            "bytes": stat.st_size,
+            "sha256": sha256_file(
+                target
+            ),
+            "mime_type": (
+                mimetypes.guess_type(
+                    target.name
+                )[0]
+                or "application/octet-stream"
+            ),
         },
         indent=2,
     )
@@ -1067,9 +2695,6 @@ def download_url(
     url: str,
     save_as: str,
 ) -> str:
-    """
-    Download a public URL into the workspace.
-    """
 
     target = safe_path(
         save_as
@@ -1084,24 +2709,86 @@ def download_url(
         url,
         headers={
             "User-Agent":
-                "personal-vps-agent/1.0"
+                "personal-vps-agent/2.0"
         },
     )
 
-    with urllib.request.urlopen(
-        request,
-        timeout=120,
-    ) as response:
+    try:
 
-        data = response.read()
+        with urllib.request.urlopen(
+            request,
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        ) as response:
 
-    target.write_bytes(
-        data
-    )
+            temp = target.with_name(
+                f".{target.name}."
+                f"{uuid.uuid4().hex}.download"
+            )
+
+            total = 0
+
+            try:
+
+                with open(
+                    temp,
+                    "wb",
+                ) as output:
+
+                    while True:
+
+                        chunk = response.read(
+                            UPLOAD_CHUNK_BYTES
+                        )
+
+                        if not chunk:
+                            break
+
+                        total += len(
+                            chunk
+                        )
+
+                        if (
+                            total
+                            > MAX_UPLOAD_BYTES
+                        ):
+                            raise ValueError(
+                                f"Download exceeds "
+                                f"{MAX_UPLOAD_MB} MB limit"
+                            )
+
+                        output.write(
+                            chunk
+                        )
+
+                    output.flush()
+
+                    os.fsync(
+                        output.fileno()
+                    )
+
+                os.replace(
+                    temp,
+                    target,
+                )
+
+            finally:
+
+                try:
+                    temp.unlink(
+                        missing_ok=True
+                    )
+                except Exception:
+                    pass
+
+    except urllib.error.URLError as exc:
+
+        return (
+            f"ERROR: download failed: {exc}"
+        )
 
     return (
-        f"Downloaded {len(data)} "
-        f"bytes -> {save_as}"
+        f"Downloaded {total} bytes -> "
+        f"{save_as}"
     )
 
 
@@ -1113,14 +2800,10 @@ def download_url(
 def download_file(
     path: str,
 ) -> str:
-    """
-    Return a direct public URL for a workspace artifact.
 
-    The file endpoint is intentionally unauthenticated,
-    matching the user's existing VPS design.
-    """
-
-    target = safe_path(path)
+    target = safe_path(
+        path
+    )
 
     if not target.exists():
 
@@ -1134,15 +2817,24 @@ def download_file(
             f"ERROR: {path} is not a file"
         )
 
+    if not PUBLIC_BASE_URL:
+
+        return (
+            "ERROR: MCP_PUBLIC_BASE_URL is not configured"
+        )
+
+    relative = relative_path(
+        target
+    )
+
     return (
-        "https://mcp-linux-production-8dfb.up.railway.app"
-        "/files/"
-        + path.lstrip("/")
+        f"{PUBLIC_BASE_URL}/files/"
+        f"{quote(relative, safe='/')}"
     )
 
 
 # ============================================================
-# ZIP DIRECTORY
+# ZIP
 # ============================================================
 
 @mcp.tool()
@@ -1150,12 +2842,14 @@ def zip_directory(
     path: str,
     output: str,
 ) -> str:
-    """
-    Create a ZIP archive of a workspace directory.
-    """
 
-    source = safe_path(path)
-    destination = safe_path(output)
+    source = safe_path(
+        path
+    )
+
+    destination = safe_path(
+        output
+    )
 
     if not source.exists():
 
@@ -1198,113 +2892,11 @@ def zip_directory(
 
 
 # ============================================================
-# CHAT / HTTP MULTIPART UPLOAD COMPATIBILITY
-# ============================================================
-
-async def upload_endpoint(request):
-    """
-    POST /upload as multipart/form-data.
-
-    Form fields:
-      - file: uploaded binary
-      - destination: optional workspace-relative directory
-
-    This exists for MCP/client integrations that can make HTTP requests but
-    cannot expose an MCP Resource attachment.
-    """
-    try:
-        form = await request.form()
-    except Exception as exc:
-        return JSONResponse(
-            {"ok": False, "error": f"invalid multipart request: {exc}"},
-            status_code=400,
-        )
-
-    upload = form.get("file")
-    destination = str(form.get("destination", "."))
-
-    if upload is None or not hasattr(upload, "read") or not hasattr(upload, "filename"):
-        return JSONResponse(
-            {"ok": False, "error": "multipart field 'file' is required"},
-            status_code=400,
-        )
-
-    filename = Path(upload.filename or "upload.bin").name
-    if not filename or filename in {".", ".."}:
-        return JSONResponse(
-            {"ok": False, "error": "invalid filename"},
-            status_code=400,
-        )
-
-    try:
-        destination_dir = safe_path(destination)
-    except ValueError:
-        return JSONResponse(
-            {"ok": False, "error": "invalid destination"},
-            status_code=400,
-        )
-
-    destination_dir.mkdir(parents=True, exist_ok=True)
-    target = safe_path(str(Path(destination) / filename))
-
-    max_upload_mb = max(1, int(os.environ.get("MCP_MAX_UPLOAD_MB", "512")))
-    max_upload_bytes = max_upload_mb * 1024 * 1024
-
-    # Stream to disk in chunks so uploads do not require holding the whole file
-    # in RAM.
-    temp_path = target.with_name(
-        f".{target.name}.{uuid.uuid4().hex}.upload"
-    )
-    total = 0
-
-    try:
-        with open(temp_path, "wb") as output:
-            while True:
-                chunk = await upload.read(1024 * 1024)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > max_upload_bytes:
-                    raise ValueError(
-                        f"upload exceeds {max_upload_mb} MB limit"
-                    )
-                output.write(chunk)
-
-        temp_path.replace(target)
-
-        return JSONResponse(
-            {
-                "ok": True,
-                "destination": relative_path(target),
-                "bytes": total,
-                "name": filename,
-                "mime_type": mimetypes.guess_type(filename)[0]
-                    or "application/octet-stream",
-                "sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
-            }
-        )
-    except Exception as exc:
-        try:
-            temp_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-        return JSONResponse(
-            {"ok": False, "error": str(exc)},
-            status_code=400,
-        )
-    finally:
-        try:
-            await upload.close()
-        except Exception:
-            pass
-
-
-# ============================================================
 # PUBLIC FILE DOWNLOAD
 # ============================================================
 
 async def download_endpoint(
-    request,
+    request: Request,
 ):
 
     path = request.path_params.get(
@@ -1321,7 +2913,9 @@ async def download_endpoint(
 
     try:
 
-        target = safe_path(path)
+        target = safe_path(
+            path
+        )
 
     except ValueError:
 
@@ -1363,35 +2957,119 @@ async def download_endpoint(
 # ============================================================
 
 async def health_endpoint(
-    request,
+    request: Request,
 ):
 
-    return JSONResponse(
-        {
-            "ok": True,
-            "service": "personal-vps",
-            "mcp": "/mcp",
-            "files": "/files/",
-            "workspace": str(WORKDIR),
-        }
-    )
+    try:
+
+        stat = shutil.disk_usage(
+            WORKDIR
+        )
+
+        return JSONResponse(
+            {
+                "ok": True,
+                "service": "personal-vps",
+                "mcp": "/mcp",
+                "upload": "/upload",
+                "upload_init": (
+                    "/upload/init"
+                ),
+                "upload_chunk": (
+                    "/upload/{upload_id}/chunk"
+                ),
+                "upload_status": (
+                    "/upload/{upload_id}"
+                ),
+                "upload_finalize": (
+                    "/upload/{upload_id}/finalize"
+                ),
+                "files": "/files/",
+                "workspace": str(
+                    WORKDIR
+                ),
+                "max_upload_mb": (
+                    MAX_UPLOAD_MB
+                ),
+                "chunk_mb": (
+                    UPLOAD_CHUNK_MB
+                ),
+                "disk_free_bytes": (
+                    stat.free
+                ),
+            }
+        )
+
+    except Exception as exc:
+
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": str(exc),
+            },
+            status_code=500,
+        )
 
 
 # ============================================================
-# REGISTER HTTP ROUTES
+# CLEANUP
 # ============================================================
 
-# These routes are registered on MCP itself.
-#
-# IMPORTANT:
-# Do NOT Mount("/mcp", ...).
-#
-# streamable_http_app() owns /mcp.
+def cleanup_loop():
+
+    while True:
+
+        try:
+
+            cleanup_stale_uploads()
+
+        except Exception:
+            pass
+
+        time.sleep(
+            15 * 60
+        )
+
+
+threading.Thread(
+    target=cleanup_loop,
+    daemon=True,
+).start()
+
+
+# ============================================================
+# ROUTES
+# ============================================================
 
 mcp.custom_route(
     "/upload",
     methods=["POST"],
 )(upload_endpoint)
+
+mcp.custom_route(
+    "/upload/raw",
+    methods=["PUT", "POST"],
+)(upload_raw_endpoint)
+
+mcp.custom_route(
+    "/upload/init",
+    methods=["POST"],
+)(upload_init_endpoint)
+
+mcp.custom_route(
+    "/upload/{upload_id}/chunk",
+    methods=["PUT", "PATCH", "POST"],
+)(upload_chunk_endpoint)
+
+mcp.custom_route(
+    "/upload/{upload_id}",
+    methods=["GET"],
+)(upload_status_endpoint)
+
+mcp.custom_route(
+    "/upload/{upload_id}/finalize",
+    methods=["POST"],
+)(upload_finalize_endpoint)
 
 mcp.custom_route(
     "/files/{path:path}",
@@ -1416,13 +3094,6 @@ if __name__ == "__main__":
         TransportSecuritySettings,
     )
 
-    port = int(
-        os.environ.get(
-            "PORT",
-            "8000",
-        )
-    )
-
     security = TransportSecuritySettings(
         enable_dns_rebinding_protection=False
     )
@@ -1432,16 +3103,48 @@ if __name__ == "__main__":
         stateless_http=True,
     )
 
-    print("==========================================")
-    print("PERSONAL VPS AGENT")
-    print("==========================================")
-    print("MCP:    /mcp")
-    print("Upload: /upload (POST multipart)\n    Files:  /files/<path>")
-    print("Health: /health")
-    print("==========================================")
+    print(
+        "=========================================="
+    )
+    print(
+        "PERSONAL VPS AGENT"
+    )
+    print(
+        "=========================================="
+    )
+    print(
+        f"Workspace: {WORKDIR}"
+    )
+    print(
+        f"MCP:       /mcp"
+    )
+    print(
+        f"Upload:    /upload"
+    )
+    print(
+        f"Raw:       /upload/raw"
+    )
+    print(
+        f"Resumable: /upload/init"
+    )
+    print(
+        f"Files:     /files/<path>"
+    )
+    print(
+        f"Health:    /health"
+    )
+    print(
+        f"Max file:  {MAX_UPLOAD_MB} MB"
+    )
+    print(
+        f"Chunk:     {UPLOAD_CHUNK_MB} MB"
+    )
+    print(
+        "=========================================="
+    )
 
     uvicorn.run(
         app,
         host="0.0.0.0",
-        port=port,
+        port=PORT,
     )
