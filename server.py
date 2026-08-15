@@ -84,16 +84,6 @@ def _build_mcp():
     except Exception:
         pass
     return FastMCP("personal-vps", **kwargs)
-        ),
-    }
-    try:
-        from mcp.server.transport_security import TransportSecuritySettings
-        kwargs["transport_security"] = TransportSecuritySettings(
-            enable_dns_rebinding_protection=False,
-        )
-    except Exception:
-        pass
-    return FastMCP("personal-vps", **kwargs)
 
 mcp = _build_mcp()
 
@@ -449,7 +439,7 @@ def finalize_upload_session(upload_id: str) -> dict:
     return upload_response(meta, "complete")
 
 # ============================================================
-# MCP TOOL: BASE64 UPLOAD (small payloads only)
+# MCP TOOL: BASE64 UPLOAD
 # ============================================================
 
 @mcp.tool()
@@ -482,7 +472,7 @@ def upload_base64(filename: str, content_base64: str, destination: str = ".") ->
         return f"ERROR: failed to write file: {exc}"
 
 # ============================================================
-# WEB UPLOAD PAGE (drag & drop from your browser)
+# WEB UPLOAD PAGE
 # ============================================================
 
 UPLOAD_PAGE_HTML = """<!doctype html>
@@ -551,7 +541,6 @@ async def upload_page_endpoint(request: Request):
 # ============================================================
 
 async def upload_endpoint(request: Request):
-    """Multipart form upload: POST /upload with field 'file'."""
     try:
         try:
             form = await request.form(max_part_size=MAX_UPLOAD_BYTES)
@@ -596,7 +585,6 @@ async def upload_endpoint(request: Request):
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
 async def upload_raw_endpoint(request: Request):
-    """Raw body upload: PUT /upload/raw?filename=x"""
     filename = (
         request.query_params.get("filename")
         or request.headers.get("x-filename")
