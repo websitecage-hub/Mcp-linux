@@ -18,7 +18,6 @@ from datetime import datetime, timezone
 from urllib.parse import quote
 
 from mcp.server.fastmcp import FastMCP
-from mcp.server.transport_security import TransportSecuritySettings
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse
 from starlette.requests import Request
 
@@ -48,51 +47,49 @@ MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 UPLOAD_CHUNK_MB = max(1, int(os.environ.get("MCP_UPLOAD_CHUNK_MB", "8")))
 UPLOAD_CHUNK_BYTES = UPLOAD_CHUNK_MB * 1024 * 1024
 
-UPLOAD_SESSION_TTL_SECONDS = max(300, int(os.environ.get("MCP_UPLOAD_SESSION_TTL", str(24 * 60 * 60))))
+UPLOAD_SESSION_TTL_SECONDS = max(
+    300, int(os.environ.get("MCP_UPLOAD_SESSION_TTL", str(24 * 60 * 60)))
+)
 
 REQUEST_TIMEOUT_SECONDS = max(5, int(os.environ.get("MCP_REQUEST_TIMEOUT", "120")))
 
 # ============================================================
-# MCP SERVER — DNS REBINDING PROTECTION DISABLED FOR RAILWAY
+# MCP SERVER (Railway-safe: no host-header rejection, no auth)
 # ============================================================
 
-mcp = FastMCP(
-    "personal-vps",
-    instructions=(
-        "You are an autonomous Linux coding/workstation backend. "
-        "Use run_command for quick commands. "
-        "Use start_job for long-running commands. "
-        "Use upload_base64 to upload files. "
-        "Use download_file for generated artifacts."
-    ),
-    host="0.0.0.0",
-    port=PORT,
-    transport_security=TransportSecuritySettings(
-        enable_dns_rebinding_protection=False,
-        allowed_hosts=["*"],
-        allowed_origins=["*"],
-    ),
-)
+def _build_mcp():
+    kwargs = {
+        "host": "0.0.0.0",
+        "port": PORT,
+        "instructions": (
+            "You are an autonomous Linux coding/workstation backend. "
+            "Use run_command for quick commands. "
+            "Use start_job for long-running commands. "
+            "Use upload_base64 to upload files. "
+            "Use download_file for generated artifacts."
+        ),
+    }
+    # Only exists in newer 1.x SDKs. Disables the DNS-rebinding
+    # Host-header check that causes "Invalid Host header" on Railway.
+    try:
+        from mcp.server.transport_security import TransportSecuritySettings
+        kwargs["transport_security"] = TransportSecuritySettings(
+            enable_dns_rebinding_protection=False,
+        )
+    except Exception:
+        pass
+    return FastMCP("personal-vps", **kwargs)
 
-# ============================================================
-# GLOBAL LOCK
-# ============================================================
+mcp = _build_mcp()
 
 UPLOAD_LOCK = threading.RLock()
 
 # ============================================================
-# TIME HELPERS
+# HELPERS
 # ============================================================
-
-def utc_now():
-    return datetime.now(timezone.utc)
 
 def utc_iso():
-    return utc_now().isoformat()
-
-# ============================================================
-# PATH HELPERS
-# ============================================================
+    return datetime.now(timezone.utc).isoformat()
 
 def safe_path(path: str) -> Path:
     if path is None:
@@ -128,12 +125,7 @@ def destination_file(destination: str, filename: str) -> Path:
     filename = sanitize_filename(filename)
     directory = safe_path(destination or ".")
     directory.mkdir(parents=True, exist_ok=True)
-    target = safe_path(str(Path(destination or ".") / filename))
-    return target
-
-# ============================================================
-# HASHING
-# ============================================================
+    return safe_path(str(Path(destination or ".") / filename))
 
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
@@ -144,10 +136,6 @@ def sha256_file(path: Path) -> str:
                 break
             digest.update(chunk)
     return digest.hexdigest()
-
-# ============================================================
-# ATOMIC WRITE
-# ============================================================
 
 def atomic_write_bytes(target: Path, data: bytes):
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -165,7 +153,7 @@ def atomic_write_bytes(target: Path, data: bytes):
             pass
 
 # ============================================================
-# SYSTEM INFO
+# SYSTEM / COMMANDS / JOBS
 # ============================================================
 
 @mcp.tool()
@@ -178,7 +166,6 @@ def system_info() -> str:
         "disk": "df -h /",
         "python": "python3 --version",
         "node": "node --version 2>/dev/null || true",
-        "npm": "npm --version 2>/dev/null || true",
         "git": "git --version 2>/dev/null || true",
     }
     result = {}
@@ -193,10 +180,6 @@ def system_info() -> str:
             result[name] = str(exc)
     return json.dumps(result, indent=2)
 
-# ============================================================
-# RUN COMMAND
-# ============================================================
-
 @mcp.tool()
 def run_command(command: str, timeout_seconds: int = 60) -> str:
     """Run a shell command and return output."""
@@ -206,21 +189,25 @@ def run_command(command: str, timeout_seconds: int = 60) -> str:
             command, shell=True, cwd=str(WORKDIR),
             capture_output=True, text=True, timeout=timeout_seconds,
         )
-        return f"exit_code: {result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        return (
+            f"exit_code: {result.returncode}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
     except subprocess.TimeoutExpired:
         return f"ERROR: timed out after {timeout_seconds}s. Use start_job."
     except Exception as exc:
         return f"ERROR: {type(exc).__name__}: {exc}"
 
-# ============================================================
-# BACKGROUND JOBS
-# ============================================================
-
 def job_paths(job_id: str):
     if not re.fullmatch(r"[0-9a-f]{12}", job_id):
         raise ValueError("Invalid job id")
     directory = JOBS_DIR / job_id
-    return directory, directory / "stdout.log", directory / "stderr.log", directory / "meta.json"
+    return (
+        directory,
+        directory / "stdout.log",
+        directory / "stderr.log",
+        directory / "meta.json",
+    )
 
 @mcp.tool()
 def start_job(command: str) -> str:
@@ -228,15 +215,18 @@ def start_job(command: str) -> str:
     job_id = uuid.uuid4().hex[:12]
     directory, stdout_log, stderr_log, meta_file = job_paths(job_id)
     directory.mkdir(parents=True, exist_ok=True)
-    meta = {"job_id": job_id, "command": command, "status": "running", "started_at": utc_iso(), "pid": None}
+    meta = {
+        "job_id": job_id, "command": command,
+        "status": "running", "started_at": utc_iso(), "pid": None,
+    }
     meta_file.write_text(json.dumps(meta, indent=2))
 
     def worker():
         try:
-            with open(stdout_log, "w") as stdout, open(stderr_log, "w") as stderr:
+            with open(stdout_log, "w") as so, open(stderr_log, "w") as se:
                 process = subprocess.Popen(
                     command, shell=True, cwd=str(WORKDIR),
-                    stdout=stdout, stderr=stderr, preexec_fn=os.setsid,
+                    stdout=so, stderr=se, preexec_fn=os.setsid,
                 )
                 meta["pid"] = process.pid
                 meta_file.write_text(json.dumps(meta, indent=2))
@@ -263,7 +253,11 @@ def job_status(job_id: str) -> str:
     meta = json.loads(meta_file.read_text())
     stdout = stdout_log.read_text(errors="replace")[-5000:] if stdout_log.exists() else ""
     stderr = stderr_log.read_text(errors="replace")[-5000:] if stderr_log.exists() else ""
-    return f"status: {meta.get('status')}\npid: {meta.get('pid')}\nexit_code: {meta.get('exit_code')}\ncommand: {meta.get('command')}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    return (
+        f"status: {meta.get('status')}\npid: {meta.get('pid')}\n"
+        f"exit_code: {meta.get('exit_code')}\ncommand: {meta.get('command')}\n"
+        f"--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    )
 
 @mcp.tool()
 def job_output(job_id: str) -> str:
@@ -285,7 +279,10 @@ def list_jobs() -> str:
             continue
         try:
             meta = json.loads(meta_file.read_text())
-            rows.append(f"{directory.name}\t{meta.get('status')}\t{str(meta.get('command', ''))[:120]}")
+            rows.append(
+                f"{directory.name}\t{meta.get('status')}\t"
+                f"{str(meta.get('command', ''))[:120]}"
+            )
         except Exception:
             continue
     return "\n".join(rows) if rows else "(no jobs)"
@@ -309,7 +306,7 @@ def kill_job(job_id: str) -> str:
     return f"Killed job {job_id}"
 
 # ============================================================
-# UPLOAD SESSION STORAGE
+# UPLOAD SESSIONS
 # ============================================================
 
 def upload_session_dir(upload_id: str) -> Path:
@@ -346,8 +343,7 @@ def cleanup_stale_uploads():
             continue
         try:
             meta = json.loads(meta_file.read_text())
-            created = float(meta.get("created_unix", 0))
-            if now - created > UPLOAD_SESSION_TTL_SECONDS:
+            if now - float(meta.get("created_unix", 0)) > UPLOAD_SESSION_TTL_SECONDS:
                 shutil.rmtree(directory, ignore_errors=True)
         except Exception:
             continue
@@ -365,7 +361,8 @@ def upload_response(meta: dict, status: str = "success") -> dict:
         "mime_type": meta.get("mime_type"),
     }
 
-def create_upload_session(filename: str, destination: str = ".", expected_bytes=None, expected_sha256=None, mime_type=None) -> dict:
+def create_upload_session(filename, destination=".", expected_bytes=None,
+                          expected_sha256=None, mime_type=None) -> dict:
     filename = sanitize_filename(filename)
     if expected_bytes is not None:
         expected_bytes = int(expected_bytes)
@@ -385,7 +382,8 @@ def create_upload_session(filename: str, destination: str = ".", expected_bytes=
         "upload_id": upload_id, "filename": filename,
         "destination": relative_path(target), "target": str(target),
         "expected_bytes": expected_bytes, "expected_sha256": expected_sha256,
-        "mime_type": mime_type or mimetypes.guess_type(filename)[0] or "application/octet-stream",
+        "mime_type": mime_type or mimetypes.guess_type(filename)[0]
+        or "application/octet-stream",
         "bytes_received": 0, "complete": False, "status": "created",
         "created_at": utc_iso(), "created_unix": time.time(),
     }
@@ -394,7 +392,6 @@ def create_upload_session(filename: str, destination: str = ".", expected_bytes=
     return meta
 
 def finalize_upload_session(upload_id: str) -> dict:
-    cleanup_stale_uploads()
     meta = load_upload_meta(upload_id)
     if meta.get("complete"):
         return upload_response(meta, "already_complete")
@@ -437,7 +434,7 @@ def finalize_upload_session(upload_id: str) -> dict:
     return upload_response(meta, "complete")
 
 # ============================================================
-# MCP TOOL: UPLOAD BASE64
+# MCP TOOL: BASE64 UPLOAD (this is the reliable one for LLM clients)
 # ============================================================
 
 @mcp.tool()
@@ -463,24 +460,35 @@ def upload_base64(filename: str, content_base64: str, destination: str = ".") ->
             "destination": relative_path(target),
             "bytes": len(data),
             "sha256": hashlib.sha256(data).hexdigest(),
-            "mime_type": mimetypes.guess_type(target.name)[0] or "application/octet-stream",
+            "mime_type": mimetypes.guess_type(target.name)[0]
+            or "application/octet-stream",
         }, indent=2)
     except Exception as exc:
         return f"ERROR: failed to write file: {exc}"
 
 # ============================================================
-# HTTP: MULTIPART UPLOAD
+# HTTP UPLOAD ENDPOINTS
 # ============================================================
 
 async def upload_endpoint(request: Request):
+    """Multipart form upload: POST /upload with field 'file'."""
     try:
-        form = await request.form(max_part_size=MAX_UPLOAD_BYTES)
+        try:
+            form = await request.form(max_part_size=MAX_UPLOAD_BYTES)
+        except TypeError:
+            form = await request.form()
         upload = form.get("file")
         destination = str(form.get("destination", "."))
         if upload is None or not hasattr(upload, "read"):
-            return JSONResponse({"ok": False, "error": "multipart field 'file' is required"}, status_code=400)
+            return JSONResponse(
+                {"ok": False, "error": "multipart field 'file' is required"},
+                status_code=400,
+            )
         filename = sanitize_filename(upload.filename or "upload.bin")
-        meta = create_upload_session(filename=filename, destination=destination, mime_type=getattr(upload, "content_type", None))
+        meta = create_upload_session(
+            filename=filename, destination=destination,
+            mime_type=getattr(upload, "content_type", None),
+        )
         upload_id = meta["upload_id"]
         data_file = upload_session_data(upload_id)
         received = 0
@@ -498,8 +506,7 @@ async def upload_endpoint(request: Request):
                 os.fsync(output.fileno())
             meta["bytes_received"] = received
             save_upload_meta(meta)
-            result = finalize_upload_session(upload_id)
-            return JSONResponse(result)
+            return JSONResponse(finalize_upload_session(upload_id))
         finally:
             try:
                 await upload.close()
@@ -508,12 +515,13 @@ async def upload_endpoint(request: Request):
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
-# ============================================================
-# HTTP: RAW UPLOAD
-# ============================================================
-
 async def upload_raw_endpoint(request: Request):
-    filename = request.query_params.get("filename") or request.headers.get("x-filename") or "upload.bin"
+    """Raw body upload: PUT /upload/raw?filename=x"""
+    filename = (
+        request.query_params.get("filename")
+        or request.headers.get("x-filename")
+        or "upload.bin"
+    )
     destination = request.query_params.get("destination", ".")
     expected_sha256 = request.headers.get("x-sha256")
     content_length = request.headers.get("content-length")
@@ -542,21 +550,18 @@ async def upload_raw_endpoint(request: Request):
             os.fsync(output.fileno())
         meta["bytes_received"] = received
         save_upload_meta(meta)
-        result = finalize_upload_session(upload_id)
-        return JSONResponse(result)
+        return JSONResponse(finalize_upload_session(upload_id))
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
-
-# ============================================================
-# HTTP: CHUNKED UPLOAD (INIT / CHUNK / STATUS / FINALIZE)
-# ============================================================
 
 async def upload_init_endpoint(request: Request):
     try:
         payload = await request.json()
         filename = payload.get("filename")
         if not filename:
-            return JSONResponse({"ok": False, "error": "filename is required"}, status_code=400)
+            return JSONResponse(
+                {"ok": False, "error": "filename is required"}, status_code=400
+            )
         meta = create_upload_session(
             filename=filename,
             destination=payload.get("destination", "."),
@@ -566,7 +571,8 @@ async def upload_init_endpoint(request: Request):
         )
         return JSONResponse({
             "ok": True, "upload_id": meta["upload_id"],
-            "chunk_size": UPLOAD_CHUNK_BYTES, "max_upload_bytes": MAX_UPLOAD_BYTES,
+            "chunk_size": UPLOAD_CHUNK_BYTES,
+            "max_upload_bytes": MAX_UPLOAD_BYTES,
             "destination": meta["destination"], "filename": meta["filename"],
         })
     except Exception as exc:
@@ -582,10 +588,12 @@ async def upload_chunk_endpoint(request: Request):
         with UPLOAD_LOCK:
             current = data_file.stat().st_size if data_file.exists() else 0
             offset_header = request.headers.get("x-upload-offset")
-            if offset_header is not None:
-                offset = int(offset_header)
-                if offset != current:
-                    return JSONResponse({"ok": False, "error": "offset mismatch", "expected_offset": current}, status_code=409)
+            if offset_header is not None and int(offset_header) != current:
+                return JSONResponse(
+                    {"ok": False, "error": "offset mismatch",
+                     "expected_offset": current},
+                    status_code=409,
+                )
             total = current
             with open(data_file, "ab") as output:
                 async for chunk in request.stream():
@@ -601,29 +609,36 @@ async def upload_chunk_endpoint(request: Request):
             meta["bytes_received"] = total
             meta["status"] = "uploading"
             save_upload_meta(meta)
-        return JSONResponse({"ok": True, "upload_id": upload_id, "bytes_received": total, "next_offset": total, "complete": False})
+        return JSONResponse({
+            "ok": True, "upload_id": upload_id,
+            "bytes_received": total, "next_offset": total, "complete": False,
+        })
     except FileNotFoundError:
-        return JSONResponse({"ok": False, "error": "upload session not found"}, status_code=404)
+        return JSONResponse(
+            {"ok": False, "error": "upload session not found"}, status_code=404
+        )
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
 async def upload_status_endpoint(request: Request):
     upload_id = request.path_params.get("upload_id")
     try:
-        meta = load_upload_meta(upload_id)
-        return JSONResponse(upload_response(meta, "status"))
+        return JSONResponse(upload_response(load_upload_meta(upload_id), "status"))
     except FileNotFoundError:
-        return JSONResponse({"ok": False, "error": "upload session not found"}, status_code=404)
+        return JSONResponse(
+            {"ok": False, "error": "upload session not found"}, status_code=404
+        )
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
 async def upload_finalize_endpoint(request: Request):
     upload_id = request.path_params.get("upload_id")
     try:
-        result = finalize_upload_session(upload_id)
-        return JSONResponse(result)
+        return JSONResponse(finalize_upload_session(upload_id))
     except FileNotFoundError:
-        return JSONResponse({"ok": False, "error": "upload session not found"}, status_code=404)
+        return JSONResponse(
+            {"ok": False, "error": "upload session not found"}, status_code=404
+        )
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
@@ -662,7 +677,7 @@ def read_file(path: str, base64_encoded: bool = False) -> str:
 
 @mcp.tool()
 def edit_file(path: str, old_str: str, new_str: str) -> str:
-    """Replace exact string in a file."""
+    """Replace an exact string in a file."""
     target = safe_path(path)
     if not target.exists():
         return f"ERROR: {path} does not exist"
@@ -735,14 +750,18 @@ def search_files(pattern: str, path: str = ".", max_results: int = 100) -> str:
     regex = re.compile(pattern)
     hits = []
     for root, dirs, files in os.walk(target):
-        dirs[:] = [d for d in dirs if d not in {".git", "__pycache__", "node_modules", ".jobs", ".uploads", ".tmp"}]
+        dirs[:] = [d for d in dirs if d not in
+                   {".git", "__pycache__", "node_modules", ".jobs", ".uploads", ".tmp"}]
         for filename in files:
             file_path = Path(root) / filename
             try:
                 with open(file_path, "r", errors="ignore") as handle:
                     for line_number, line in enumerate(handle, 1):
                         if regex.search(line):
-                            hits.append(f"{file_path.relative_to(WORKDIR)}:{line_number}:{line.strip()[:300]}")
+                            hits.append(
+                                f"{file_path.relative_to(WORKDIR)}:{line_number}:"
+                                f"{line.strip()[:300]}"
+                            )
                             if len(hits) >= max_results:
                                 return "\n".join(hits)
             except (PermissionError, OSError):
@@ -760,13 +779,14 @@ def file_info(path: str) -> str:
     stat = target.stat()
     return json.dumps({
         "path": path, "name": target.name, "bytes": stat.st_size,
-        "mime_type": mimetypes.guess_type(target.name)[0] or "application/octet-stream",
+        "mime_type": mimetypes.guess_type(target.name)[0]
+        or "application/octet-stream",
         "modified": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
     }, indent=2)
 
 @mcp.tool()
 def verify_file(path: str) -> str:
-    """Verify file exists and get SHA-256."""
+    """Verify a file and get its SHA-256."""
     target = safe_path(path)
     if not target.exists():
         return json.dumps({"ok": False, "error": "file does not exist"}, indent=2)
@@ -776,16 +796,13 @@ def verify_file(path: str) -> str:
     return json.dumps({
         "ok": True, "path": relative_path(target), "name": target.name,
         "bytes": stat.st_size, "sha256": sha256_file(target),
-        "mime_type": mimetypes.guess_type(target.name)[0] or "application/octet-stream",
+        "mime_type": mimetypes.guess_type(target.name)[0]
+        or "application/octet-stream",
     }, indent=2)
-
-# ============================================================
-# INTERNET DOWNLOAD
-# ============================================================
 
 @mcp.tool()
 def download_url(url: str, save_as: str) -> str:
-    """Download a file from URL."""
+    """Download a file from the internet into the workspace."""
     target = safe_path(save_as)
     target.parent.mkdir(parents=True, exist_ok=True)
     req = urllib.request.Request(url, headers={"User-Agent": "personal-vps-agent/2.0"})
@@ -801,7 +818,9 @@ def download_url(url: str, save_as: str) -> str:
                             break
                         total += len(chunk)
                         if total > MAX_UPLOAD_BYTES:
-                            raise ValueError(f"Download exceeds {MAX_UPLOAD_MB} MB limit")
+                            raise ValueError(
+                                f"Download exceeds {MAX_UPLOAD_MB} MB limit"
+                            )
                         output.write(chunk)
                     output.flush()
                     os.fsync(output.fileno())
@@ -815,13 +834,9 @@ def download_url(url: str, save_as: str) -> str:
         return f"ERROR: download failed: {exc}"
     return f"Downloaded {total} bytes -> {save_as}"
 
-# ============================================================
-# DOWNLOAD FILE (VPS → BROWSER)
-# ============================================================
-
 @mcp.tool()
 def download_file(path: str) -> str:
-    """Get a download URL for a file on the VPS."""
+    """Get a browser download URL for a file on the VPS."""
     target = safe_path(path)
     if not target.exists():
         return f"ERROR: {path} does not exist"
@@ -829,12 +844,7 @@ def download_file(path: str) -> str:
         return f"ERROR: {path} is not a file"
     if not PUBLIC_BASE_URL:
         return "ERROR: MCP_PUBLIC_BASE_URL is not configured"
-    relative = relative_path(target)
-    return f"{PUBLIC_BASE_URL}/files/{quote(relative, safe='/')}"
-
-# ============================================================
-# ZIP
-# ============================================================
+    return f"{PUBLIC_BASE_URL}/files/{quote(relative_path(target), safe='/')}"
 
 @mcp.tool()
 def zip_directory(path: str, output: str) -> str:
@@ -853,7 +863,7 @@ def zip_directory(path: str, output: str) -> str:
     return f"Created {output} ({destination.stat().st_size} bytes)"
 
 # ============================================================
-# HTTP: FILE DOWNLOAD
+# HTTP: FILE DOWNLOAD / HEALTH
 # ============================================================
 
 async def download_endpoint(request: Request):
@@ -871,10 +881,6 @@ async def download_endpoint(request: Request):
     mime = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
     return FileResponse(target, media_type=mime, filename=target.name)
 
-# ============================================================
-# HTTP: HEALTH CHECK
-# ============================================================
-
 async def health_endpoint(request: Request):
     try:
         stat = shutil.disk_usage(WORKDIR)
@@ -889,7 +895,7 @@ async def health_endpoint(request: Request):
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
 # ============================================================
-# CLEANUP LOOP
+# CLEANUP LOOP + ROUTES
 # ============================================================
 
 def cleanup_loop():
@@ -902,10 +908,6 @@ def cleanup_loop():
 
 threading.Thread(target=cleanup_loop, daemon=True).start()
 
-# ============================================================
-# ROUTES
-# ============================================================
-
 mcp.custom_route("/upload", methods=["POST"])(upload_endpoint)
 mcp.custom_route("/upload/raw", methods=["PUT", "POST"])(upload_raw_endpoint)
 mcp.custom_route("/upload/init", methods=["POST"])(upload_init_endpoint)
@@ -916,17 +918,13 @@ mcp.custom_route("/files/{path:path}", methods=["GET"])(download_endpoint)
 mcp.custom_route("/health", methods=["GET"])(health_endpoint)
 
 # ============================================================
-# START SERVER
+# START
 # ============================================================
 
 if __name__ == "__main__":
     print("=" * 50)
     print("PERSONAL VPS AGENT")
-    print("=" * 50)
     print(f"Workspace: {WORKDIR}")
-    print(f"MCP:       /mcp")
-    print(f"Upload:    /upload")
-    print(f"Health:    /health")
-    print(f"Max file:  {MAX_UPLOAD_MB} MB")
+    print(f"Port:      {PORT}")
     print("=" * 50)
     mcp.run(transport="streamable-http")
