@@ -257,8 +257,15 @@ def download_url(url: str, save_as: str) -> str:
 
 if __name__ == "__main__":
     import uvicorn
+    from mcp.server.transport_security import TransportSecuritySettings
 
     port = int(os.environ.get("PORT", "8000"))
-    app = mcp.streamable_http_app()
-    print("MCP endpoint: /mcp  (open, no auth)")
+    # Railway/Render put this behind a proxy with a real public hostname -
+    # the SDK's DNS-rebinding protection rejects any Host header that isn't
+    # localhost by default ("Invalid Host header"). Disabling it entirely
+    # here, consistent with running this as an open, no-auth personal server.
+    security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+    app = mcp.streamable_http_app(transport_security=security)
+    print("MCP endpoint: /mcp  (open, no auth, any host allowed)")
     uvicorn.run(app, host="0.0.0.0", port=port)
+        
