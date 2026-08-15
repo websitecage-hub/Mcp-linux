@@ -70,7 +70,20 @@ def _build_mcp():
             "tell the user to open the web upload page at the server root URL, "
             "drop the file there, then operate on it in the workspace. "
             "Alternatively use download_url if the user provides a public URL. "
+            "IMPORTANT: After creating ANY file (video, image, zip, etc.), "
+            "ALWAYS call download_file with the file path to give the user "
+            "a clickable download link. Never skip this step. "
             "Use download_file for generated artifacts."
+        ),
+    }
+    try:
+        from mcp.server.transport_security import TransportSecuritySettings
+        kwargs["transport_security"] = TransportSecuritySettings(
+            enable_dns_rebinding_protection=False,
+        )
+    except Exception:
+        pass
+    return FastMCP("personal-vps", **kwargs)
         ),
     }
     try:
